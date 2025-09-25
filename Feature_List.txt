@@ -1,0 +1,17 @@
+Market_Prices
+Weather
+Climate
+Pesticide
+Pesticide Alternatives
+Insecticide
+Insecticide Alternatives
+Fertilizer
+Crop Seasons {Algor Climactic Zone Calenders}
+Seed variety/Hybrid recoomendations
+Soil Types and their Stats like pH
+Irrigation Scheduling and Evapotranspiration with crop Coeffcients
+Seassonal Pests and Diseases
+Procurement and their centers
+Ware house and Cold Storage Availability
+Nearest Markets  and their operating hours
+
