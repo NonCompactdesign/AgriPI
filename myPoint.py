@@ -3,6 +3,12 @@ import requests
 from datetime import datetime, timedelta
 import pandas as pd
 
+import re
+from urllib.parse import urljoin
+from urllib.parse import urlencode
+
+import json
+
 app = Flask(__name__)
 
 # THIS IS MY FUCKING API KEY, DO NOT STEAL IT
@@ -99,7 +105,7 @@ def weather():
             "start_date": start_date,
             "end_date": end_date,
             "hourly": "temperature_2m,precipitation,windspeed_10m,shortwave_radiation",
-            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,et0_fao_evapotranspiration,uv_index_max,uv_index_clear_sky_max",
             "timezone": "Asia/Kolkata"
         }
         resp = requests.get(base_url, params=params)
@@ -169,6 +175,317 @@ def pesticide_check():
     return jsonify({
         "pesticide": name,
         "status": status
+    })
+
+
+_SOILGRIDS_SCALE = {
+    "bdod": 0.01,   # kg/dm3 from cg/cm3 integers
+    "cec": 0.1,     # cmol(c)/kg from mmol(c)/kg integers
+    "cfvo": 0.1,    # vol%
+    "clay": 0.1,    # %
+    "nitrogen": 0.01,# g/kg
+    "phh2o": 0.1,   # pH
+    "sand": 0.1,    # %
+    "silt": 0.1,    # %
+    "soc": 0.1,     # g/kg
+    "ocd": 0.1,     # kg/dm3 (if requested)
+    "ocs": 0.1,     # kg/m2 (if requested)
+    "wv0010": 0.1,  # vol% (if requested)
+    "wv0033": 0.1,  # vol% (if requested)
+    "wv1500": 0.1   # vol% (if requested)
+}
+
+_SOILGRIDS_PROPS = {
+    "phh2o": "soil_pH_H2O",
+    "soc": "soil_organic_carbon",
+    "clay": "clay_percent",
+    "sand": "sand_percent",
+    "silt": "silt_percent",
+    "bdod": "bulk_density",
+    "cec": "cation_exchange_capacity"
+}
+
+_STD_DEPTHS = ["0-5", "5-15", "15-30", "30-60", "60-100", "100-200"]
+
+def _norm_depths(depths_in):
+    out = []
+    for d in depths_in:
+        dd = d.strip().lower().replace("cm", "")
+        if dd in _STD_DEPTHS:
+            out.append(f"{dd}cm")
+    return out
+
+def _values_to_dict(vals):
+    # SoilGrids v2 may return a dict {"mean":int,"Q0.5":int,...} or a list [{"name":"mean","value":int},...]
+    if isinstance(vals, dict):
+        return vals
+    if isinstance(vals, list):
+        bag = {}
+        for it in vals:
+            nm = (it.get("name") or "").strip()
+            if nm:
+                bag[nm] = it.get("value")
+        return bag
+    return {}
+
+@app.route("/v1/soil/soilgrids", methods=["GET"])
+def soil_soilgrids():
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    if not lat or not lon:
+        return jsonify({"error": "Missing lat/lon"}), 400
+
+    props_q = request.args.get("properties", ",".join(_SOILGRIDS_PROPS.keys())).lower()
+    req_props = [p.strip() for p in props_q.split(",") if p.strip()]
+    props = [p for p in req_props if p in _SOILGRIDS_PROPS]
+    if not props:
+        props = list(_SOILGRIDS_PROPS.keys())
+
+    depths_q = request.args.get("depths")
+    if depths_q:
+        depths = _norm_depths([d for d in depths_q.split(",") if d.strip()])
+        if not depths:
+            depths = [f"{d}cm" for d in _STD_DEPTHS]
+    else:
+        depths = [f"{d}cm" for d in _STD_DEPTHS]
+
+    base = "https://rest.isric.org/soilgrids/v2.0/properties/query"
+    params = [("lon", lon), ("lat", lat)]
+    for p in props:
+        params.append(("property", p))
+    for d in depths:
+        params.append(("depth", d))
+    # ask server for all stats; we’ll pick best available below
+    try:
+        r = requests.get(base, params=params, timeout=25, headers={"User-Agent": "kerala-farm-assist/1.0", "Accept": "application/json"})
+        r.raise_for_status()
+        js = r.json()
+    except Exception as e:
+        return jsonify({"error": "Failed to fetch SoilGrids", "details": str(e)}), 502
+
+    layers = None
+    if isinstance(js, dict):
+        layers = js.get("properties", {}).get("layers") or js.get("layers")
+    if not isinstance(layers, list):
+        return jsonify({"error": "Unexpected SoilGrids schema", "raw_keys": list(js.keys()) if isinstance(js, dict) else "n/a"}), 502
+
+    results = []
+    for layer in layers:
+        name = layer.get("name")
+        scale = _SOILGRIDS_SCALE.get(name, 1.0)
+        friendly = _SOILGRIDS_PROPS.get(name, name)
+        for dp in layer.get("depths", []):
+            label = dp.get("label")
+            vals_raw = dp.get("values")
+            vals = _values_to_dict(vals_raw)
+            # prefer mean, fallback to Q0.5, final fallback to midpoint of Q0.05/Q0.95
+            val = vals.get("mean")
+            if val is None:
+                val = vals.get("Q0.5") or vals.get("Q50") or vals.get("median")
+            if val is None and vals.get("Q0.05") is not None and vals.get("Q0.95") is not None:
+                try:
+                    val = (float(vals.get("Q0.05")) + float(vals.get("Q0.95"))) / 2.0
+                except:
+                    val = None
+            if val is not None:
+                try:
+                    val = float(val) * scale
+                except:
+                    val = None
+            results.append({
+                "property": friendly,
+                "depth": label,
+                "value_type": "mean_or_median_scaled",
+                "value": val
+            })
+
+    return jsonify({
+        "query": {"lat": lat, "lon": lon, "properties": props, "depths": depths, "stat_preference": ["mean", "Q0.5", "mid(Q0.05,Q0.95)"]},
+        "count": len(results),
+        "results": results,
+        "source": {"service": "ISRIC SoilGrids v2", "endpoint": base}
+    })
+# ==========================================================
+# AIR QUALITY: OpenAQ v2 — latest measurements near a point
+# ==========================================================
+
+@app.route("/v1/air/nearest", methods=["GET"])
+def air_nearest():
+    """
+    Latest air quality measurements from OpenAQ near a coordinate.
+    Params:
+      - lat (required)
+      - lon (required)
+      - radius_m (optional, default 10000)
+      - limit (optional, default 5)
+      - parameters (optional, comma-separated e.g., pm25,pm10,no2,o3,so2,co)
+    """
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    if not lat or not lon:
+        return jsonify({"error": "Missing lat/lon"}), 400
+
+    try:
+        radius = int(request.args.get("radius_m", 10000))
+    except:
+        radius = 10000
+
+    try:
+        limit = int(request.args.get("limit", 5))
+    except:
+        limit = 5
+
+    params = {
+        "coordinates": f"{lat},{lon}",
+        "radius": radius,
+        "limit": limit,
+        "order_by": "distance",
+        "sort": "asc"
+    }
+    # Optional filter by pollutant parameters
+    parameters_csv = request.args.get("parameters")
+    if parameters_csv:
+        params["parameters[]"] = [p.strip() for p in parameters_csv.split(",") if p.strip()]
+
+    url = "https://api.openaq.org/v2/latest"
+    try:
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "kerala-farm-assist/1.0"})
+        r.raise_for_status()
+        js = r.json()
+    except Exception as e:
+        return jsonify({"error": "Failed to fetch OpenAQ", "details": str(e)}), 502
+
+    # Simplify output
+    simplified = []
+    for loc in js.get("results", []):
+        coord = loc.get("coordinates") or {}
+        for m in loc.get("measurements", []):
+            simplified.append({
+                "location": loc.get("location"),
+                "distance_m": loc.get("distance"),
+                "parameter": m.get("parameter"),
+                "value": m.get("value"),
+                "unit": m.get("unit"),
+                "last_updated": m.get("lastUpdated"),
+                "lat": coord.get("latitude"),
+                "lon": coord.get("longitude"),
+                "city": loc.get("city"),
+                "country": loc.get("country")
+            })
+
+    return jsonify({
+        "query": {"lat": lat, "lon": lon, "radius_m": radius, "limit": limit, "parameters": params.get("parameters[]")},
+        "count": len(simplified),
+        "results": simplified,
+        "source": {"service": "OpenAQ v2", "endpoint": url}
+    })
+
+# =================================================
+# GEOCODING: Nominatim (OpenStreetMap) — no API key
+# =================================================
+
+_NOMINATIM_BASE = "https://nominatim.openstreetmap.org"
+
+def _nominatim_headers():
+    # Respect usage policy: set a descriptive User-Agent
+    return {"User-Agent": "kerala-farm-assist/1.0"}
+
+@app.route("/v1/geocode/search", methods=["GET"])
+def geocode_search():
+    """
+    Forward geocoding with Nominatim.
+    Params:
+      - q (required): free text, e.g., "Aluva market Ernakulam Kerala"
+      - limit (optional, default 5)
+      - countrycodes (optional, default 'in')
+    """
+    q = request.args.get("q")
+    if not q:
+        return jsonify({"error": "Missing 'q'"}), 400
+
+    try:
+        limit = int(request.args.get("limit", 5))
+    except:
+        limit = 5
+
+    countrycodes = request.args.get("countrycodes", "in")
+
+    params = {
+        "q": q,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "limit": limit,
+        "countrycodes": countrycodes
+    }
+    url = f"{_NOMINATIM_BASE}/search"
+    try:
+        r = requests.get(url, params=params, timeout=20, headers=_nominatim_headers())
+        r.raise_for_status()
+        items = r.json()
+    except Exception as e:
+        return jsonify({"error": "Failed to geocode", "details": str(e)}), 502
+
+    results = []
+    for it in items:
+        results.append({
+            "display_name": it.get("display_name"),
+            "lat": float(it.get("lat")) if it.get("lat") else None,
+            "lon": float(it.get("lon")) if it.get("lon") else None,
+            "type": it.get("type"),
+            "class": it.get("class"),
+            "importance": it.get("importance"),
+            "address": it.get("address")
+        })
+
+    return jsonify({
+        "count": len(results),
+        "results": results,
+        "source": {"service": "Nominatim", "endpoint": url}
+    })
+
+@app.route("/v1/geocode/reverse", methods=["GET"])
+def geocode_reverse():
+    """
+    Reverse geocoding with Nominatim.
+    Params:
+      - lat (required)
+      - lon (required)
+      - zoom (optional, 0..18, default 16)
+    """
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    if not lat or not lon:
+        return jsonify({"error": "Missing lat/lon"}), 400
+
+    try:
+        zoom = int(request.args.get("zoom", 16))
+    except:
+        zoom = 16
+
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "zoom": zoom
+    }
+    url = f"{_NOMINATIM_BASE}/reverse"
+    try:
+        r = requests.get(url, params=params, timeout=20, headers=_nominatim_headers())
+        r.raise_for_status()
+        js = r.json()
+    except Exception as e:
+        return jsonify({"error": "Failed to reverse geocode", "details": str(e)}), 502
+
+    out = {
+        "display_name": js.get("display_name"),
+        "lat": float(js.get("lat")) if js.get("lat") else None,
+        "lon": float(js.get("lon")) if js.get("lon") else None,
+        "address": js.get("address")
+    }
+    return jsonify({
+        "result": out,
+        "source": {"service": "Nominatim", "endpoint": url}
     })
 
 
